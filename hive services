@@ -1,0 +1,2276 @@
+--[[
+    HIVE SERVICES - Interface futurista própria (sem Rayfield)
+    - Aba MIRA: aim lock no tronco ou na cabeça (FOV, suavidade, team check, wall check)
+    - Aba VISUAL: chams (jogadores pintados) + barra de vida
+    - Aba ESP: caixa, nome, vida e distância
+    - Aba CÉU: vários céus (galáxia, nebulosa, aurora...) | Aba CROSSHAIR: miras com ID
+    - Aba EXTRA: shader realista + FOV da câmera (até 120) + esticar tela + anti lag
+    - Atalhos: H = liga/desliga aim | RightShift = esconde/mostra o menu
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+-- se o hub já estiver aberto (executou de novo), fecha o antigo antes de abrir este
+local env = (getgenv and getgenv()) or _G
+if env.TomajackFechar then
+    pcall(env.TomajackFechar)
+end
+
+local hubFechado = false
+local Conex = {} -- conexões que precisam ser desligadas ao fechar
+
+-- ================= CONFIG =================
+local Config = {
+    Ligado = false,
+    FOV = 150,
+    Suavidade = 1,
+    TeamCheck = false,     -- em RP todo mundo costuma ser do mesmo time: ligado, ele ignora todos
+    WallCheck = true,
+    WallCheckMax = 300,    -- acima dessa distância a parede é ignorada (longe o raio erra muito)
+    SoSegurando = true,
+    IgnorarAmigos = true,  -- não trava em amigos do Roblox
+    MostrarFOV = true,
+    AlvoParte = "Tronco",  -- "Tronco" ou "Cabeça" (parte do corpo que o aim lock mira)
+    AlcanceMax = 10000,    -- distância máxima (studs) para o aimlock pegar alguém
+    FOVDinamico = true,    -- alvos longe aceitam um FOV maior (eles ficam pequenos na tela)
+
+    Chams = false,
+    ChamsCor = Color3.fromRGB(255, 30, 30),
+    ChamsPreenchimento = 0.3,
+    ChamsContorno = true,
+    ChamsAtravesParede = true,
+    ChamsIgnorarTime = true,
+
+    BarraVida = false,
+    AlturaBarra = 1.2,
+    EspDistancia = 1500,
+
+    Esp = false,
+    EspCaixa = true,
+    EspNome = true,
+    EspVidaLado = true,
+    EspDistTexto = true,
+    EspCor = Color3.fromRGB(255, 255, 255),
+    EspNomeCor = Color3.fromRGB(255, 220, 0),
+    EspSoInimigos = true,
+
+    Mira = false,
+    MiraId = 1,
+    MiraCor = Color3.fromRGB(255, 30, 30),
+    MiraTam = 1,
+    MiraImagem = "",       -- ID de imagem do Roblox (opcional, no lugar dos modelos prontos)
+
+    Shader = false,
+    ShaderNivel = 2,       -- 1 = leve | 2 = realista | 3 = ultra (gráfico bem forte)
+    ShaderIntensidade = 1, -- ajuste fino em cima do nível: 0.2 = fraco | 1 = normal | 1.5 = forte
+
+
+    CamFOVAtivo = false,
+    CamFOV = 90,           -- campo de visão da câmera (o Roblox aceita até 120)
+
+    Esticar = false,
+    EsticarValor = 0.65, -- menor = mais esticado
+}
+
+-- ================= CÍRCULO DO FOV =================
+local circulo
+if typeof(Drawing) == "table" or typeof(Drawing) == "function" then
+    pcall(function()
+        circulo = Drawing.new("Circle")
+        circulo.Thickness = 1
+        circulo.NumSides = 64
+        circulo.Filled = false
+        circulo.Transparency = 1
+        circulo.Color = Color3.fromRGB(255, 30, 30)
+        circulo.Visible = false
+    end)
+end
+
+local temDrawing = circulo ~= nil
+
+-- ================= CACHE =================
+local infos = {}
+local jogadores = {}
+
+local function atualizarLista()
+    local nova = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            nova[#nova + 1] = p
+        end
+    end
+    jogadores = nova
+end
+
+atualizarLista()
+Conex[#Conex + 1] = Players.PlayerAdded:Connect(atualizarLista)
+Conex[#Conex + 1] = Players.PlayerRemoving:Connect(function() task.defer(atualizarLista) end)
+
+local function getInfo(p)
+    local char = p.Character
+    if not char then
+        return nil
+    end
+
+    local info = infos[p]
+    if not info then
+        info = { proxCheck = 0 }
+        infos[p] = info
+    end
+
+    if info.char ~= char then
+        info.char = char
+        info.hum = nil
+        info.cabeca = nil
+        info.tronco = nil
+        info.pctInt = nil
+        info.proxCheck = 0
+    end
+
+    local invalido = not info.tronco or not info.cabeca
+        or not info.tronco.Parent or not info.cabeca.Parent
+    if invalido and os.clock() >= info.proxCheck then
+        info.proxCheck = os.clock() + 0.5
+        info.hum = char:FindFirstChildOfClass("Humanoid")
+        info.tronco = char:FindFirstChild("UpperTorso")
+            or char:FindFirstChild("Torso")
+            or char:FindFirstChild("HumanoidRootPart")
+            or char.PrimaryPart
+            or char:FindFirstChildWhichIsA("BasePart")
+        -- personagens custom de RP: se não tiver "Head", mira no tronco
+        info.cabeca = char:FindFirstChild("Head") or info.tronco
+    end
+
+    return info
+end
+
+-- ================= RAYCAST (reutilizado) =================
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- Vê se há parede entre a câmera e a parte. Partes transparentes ou sem colisão
+-- (vidro, grades, efeitos, hitboxes invisíveis) são ignoradas, porque de longe
+-- elas costumavam bloquear o aimlock sem ser uma parede de verdade.
+local function modeloDoAssento(char)
+    -- carro/moto em que a pessoa está sentada (não deve contar como parede)
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local assento = hum and hum.SeatPart
+    if not assento then return nil end
+    return assento:FindFirstAncestorOfClass("Model") or assento
+end
+
+local function raioLivre(origem, destino, char, filtroBase)
+    local filtro = table.clone(filtroBase)
+    local direcao = destino - origem
+    for _ = 1, 6 do
+        rayParams.FilterDescendantsInstances = filtro
+        local r = Workspace:Raycast(origem, direcao, rayParams)
+        if not r then return true end
+
+        local alvo = r.Instance
+        if alvo:IsDescendantOf(char) then return true end
+
+        local pai = alvo.Parent
+        local ehPessoa = pai and (pai:FindFirstChildOfClass("Humanoid")
+            or (pai.Parent and pai.Parent:FindFirstChildOfClass("Humanoid")))
+        if ehPessoa or alvo.Transparency >= 0.9 or not alvo.CanCollide then
+            filtro[#filtro + 1] = alvo -- não é parede: ignora e continua
+        else
+            return false
+        end
+    end
+    return false
+end
+
+-- Vê se há parede entre a câmera e o alvo. Testa a parte mirada e também cabeça e
+-- corpo: se qualquer um aparecer, o alvo conta como visível (evita falhar quando só
+-- um pedaço está atrás de algo, ou quando a pessoa está dentro de um carro).
+local function temVisao(parte, char)
+    if not Config.WallCheck then return true end
+
+    local origem = camera.CFrame.Position
+    if (parte.Position - origem).Magnitude > Config.WallCheckMax then return true end
+    local filtroBase = {}
+    if player.Character then filtroBase[#filtroBase + 1] = player.Character end
+    local meuCarro = modeloDoAssento(player.Character)
+    if meuCarro then filtroBase[#filtroBase + 1] = meuCarro end
+    local carroDele = modeloDoAssento(char)
+    if carroDele then filtroBase[#filtroBase + 1] = carroDele end
+
+    if raioLivre(origem, parte.Position, char, filtroBase) then return true end
+
+    local cabeca = char:FindFirstChild("Head")
+    if cabeca and cabeca ~= parte and raioLivre(origem, cabeca.Position, char, filtroBase) then
+        return true
+    end
+    local raiz = char:FindFirstChild("HumanoidRootPart")
+    if raiz and raiz ~= parte and raioLivre(origem, raiz.Position, char, filtroBase) then
+        return true
+    end
+    return false
+end
+
+-- ================= AIM LOCK =================
+local bloqueados = {}
+
+-- ---- jogadores que o aimlock nunca deve travar (amigos / lista de nicks) ----
+local listaIgnorar = {}   -- [nick em minúsculo] = true
+local cacheAmigo = {}     -- [player] = true/false (consulta ao Roblox é lenta, então guarda)
+
+local function ignorado(outro)
+    if listaIgnorar[string.lower(outro.Name)] or listaIgnorar[string.lower(outro.DisplayName)] then
+        return true
+    end
+    if Config.IgnorarAmigos then
+        local c = cacheAmigo[outro]
+        if c == nil then
+            cacheAmigo[outro] = false -- evita consultar de novo enquanto espera
+            task.spawn(function()
+                local ok, res = pcall(function() return player:IsFriendsWith(outro.UserId) end)
+                cacheAmigo[outro] = ok and res or false
+            end)
+            return false
+        end
+        return c
+    end
+    return false
+end
+
+local function acharAlvo()
+    local centro = UserInputService:GetMouseLocation()
+    local camPos = camera.CFrame.Position
+    table.clear(bloqueados)
+
+    for _ = 1, 4 do
+        local melhorParte, melhorChar
+        local melhorNota = 1 -- nota = distância até a mira / FOV permitido (menor é melhor, 1 = borda)
+
+        for _, outro in ipairs(jogadores) do
+            local info = getInfo(outro)
+            -- parte que vai ser mirada: cabeça ou tronco
+            local parte = info and ((Config.AlvoParte == "Cabeça" and info.cabeca) or info.tronco)
+            if info and parte and parte.Parent
+                and (not info.hum or info.hum.Health > 0)
+                and not bloqueados[parte]
+                and not ignorado(outro)
+                and not (Config.TeamCheck and outro.Team ~= nil and outro.Team == player.Team)
+            then
+                local distMundo = (parte.Position - camPos).Magnitude
+                if distMundo <= Config.AlcanceMax then
+                    local pos, naTela = camera:WorldToViewportPoint(parte.Position)
+                    if naTela and pos.Z > 0 then
+                        -- quem está longe fica pequeno na tela: aceita um FOV até 2x maior
+                        local limite = Config.FOV
+                        if Config.FOVDinamico then
+                            limite = limite * (1 + math.min(distMundo / 150, 5)) -- até 6x maior para quem está bem longe
+                        end
+
+                        local dx, dy = pos.X - centro.X, pos.Y - centro.Y
+                        local nota = math.sqrt(dx * dx + dy * dy) / limite
+                        if nota < melhorNota then
+                            melhorNota = nota
+                            melhorParte = parte
+                            melhorChar = info.char
+                        end
+                    end
+                end
+            end
+        end
+
+        if not melhorParte then
+            return nil
+        end
+        if temVisao(melhorParte, melhorChar) then
+            return melhorParte
+        end
+        bloqueados[melhorParte] = true
+    end
+
+    return nil
+end
+
+local PRIORIDADE_AIM = Enum.RenderPriority.Camera.Value + 1
+local PRIORIDADE_ESTICAR = Enum.RenderPriority.Camera.Value + 2
+local PRIORIDADE_VIDA = Enum.RenderPriority.Camera.Value + 3
+
+local circuloVisivel = false
+
+RunService:BindToRenderStep("AimLockTronco", Enum.RenderPriority.Last.Value, function()
+    camera = Workspace.CurrentCamera
+
+    if circulo then
+        local mostrar = Config.Ligado and Config.MostrarFOV
+        if mostrar then
+            circulo.Radius = Config.FOV
+            circulo.Position = UserInputService:GetMouseLocation()
+            circulo.Visible = true
+            circuloVisivel = true
+        elseif circuloVisivel then
+            circulo.Visible = false
+            circuloVisivel = false
+        end
+    end
+
+    if not Config.Ligado then return end
+
+    if Config.SoSegurando and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+        return
+    end
+
+    local alvo = acharAlvo()
+    if alvo then
+        local alvoCFrame = CFrame.new(camera.CFrame.Position, alvo.Position)
+        camera.CFrame = camera.CFrame:Lerp(alvoCFrame, Config.Suavidade)
+    end
+end)
+
+-- ================= CHAMS (JOGADORES PINTADOS) =================
+local chamsPasta = Instance.new("Folder")
+chamsPasta.Name = "TomajackChams"
+do
+    local ok = pcall(function()
+        chamsPasta.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok or not chamsPasta.Parent then
+        chamsPasta.Parent = player:WaitForChild("PlayerGui")
+    end
+end
+
+local chams = {}
+
+local function esconderChams(p)
+    local h = chams[p]
+    if h then
+        h.Enabled = false
+    end
+end
+
+local function removerChams(p)
+    local h = chams[p]
+    if h then
+        pcall(function() h:Destroy() end)
+        chams[p] = nil
+    end
+end
+
+local function atualizarChams(p)
+    local char = p.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+    local deveMostrar = Config.Chams
+        and char ~= nil
+        and char.Parent ~= nil
+        and hum ~= nil
+        and hum.Health > 0
+        and not (Config.ChamsIgnorarTime and p.Team ~= nil and p.Team == player.Team)
+
+    if not deveMostrar then
+        esconderChams(p)
+        return
+    end
+
+    local h = chams[p]
+    if not h or not h.Parent then
+        h = Instance.new("Highlight")
+        h.Name = "Chams_" .. p.Name
+        h.Parent = chamsPasta
+        chams[p] = h
+    end
+
+    if h.Adornee ~= char then
+        h.Adornee = char
+    end
+
+    h.FillColor = Config.ChamsCor
+    h.OutlineColor = Config.ChamsCor
+    h.FillTransparency = Config.ChamsPreenchimento
+    h.OutlineTransparency = Config.ChamsContorno and 0 or 1
+    h.DepthMode = Config.ChamsAtravesParede
+        and Enum.HighlightDepthMode.AlwaysOnTop
+        or Enum.HighlightDepthMode.Occluded
+    h.Enabled = true
+end
+
+Conex[#Conex + 1] = Players.PlayerRemoving:Connect(function(p)
+    removerChams(p)
+    local info = infos[p]
+    if info then
+        if info.barraBorda then pcall(function() info.barraBorda:Remove() end) end
+        if info.barraVida then pcall(function() info.barraVida:Remove() end) end
+        if info.esp then
+            for _, d in pairs(info.esp) do
+                pcall(function() d:Remove() end)
+            end
+        end
+    end
+    infos[p] = nil
+    task.defer(atualizarLista)
+end)
+
+local chamsEstavaLigado = false
+task.spawn(function()
+    while not hubFechado do
+        if Config.Chams then
+            chamsEstavaLigado = true
+            for _, outro in ipairs(jogadores) do
+                pcall(atualizarChams, outro)
+            end
+        elseif chamsEstavaLigado then
+            for p in pairs(chams) do
+                esconderChams(p)
+            end
+            chamsEstavaLigado = false
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- ================= BARRA DE VIDA EM CIMA DO NOME =================
+local function novoQuadrado()
+    local q = Drawing.new("Square")
+    q.Filled = true
+    q.Thickness = 1
+    q.Transparency = 1
+    q.Visible = false
+    return q
+end
+
+local function esconderBarra(info)
+    if info.barraVisivel then
+        info.barraBorda.Visible = false
+        info.barraVida.Visible = false
+        info.barraVisivel = false
+    end
+end
+
+local function paraTela(posicao)
+    local ponto = camera:WorldToViewportPoint(posicao)
+    if ponto.Z <= 0 then
+        return nil
+    end
+    return Vector2.new(ponto.X, ponto.Y)
+end
+
+local function desenharBarra(outro, camPos)
+    local info = getInfo(outro)
+    if not info then
+        local antigo = infos[outro]
+        if antigo then esconderBarra(antigo) end
+        return
+    end
+
+    local hum, cabeca, tronco = info.hum, info.cabeca, info.tronco
+    if not (hum and cabeca and tronco and cabeca.Parent and tronco.Parent)
+        or hum.Health <= 0
+        or (Config.ChamsIgnorarTime and outro.Team ~= nil and outro.Team == player.Team)
+        or (tronco.Position - camPos).Magnitude > Config.EspDistancia
+    then
+        esconderBarra(info)
+        return
+    end
+
+    local topo = cabeca.Position + Vector3.new(0, Config.AlturaBarra, 0)
+    local p1 = paraTela(topo)
+    local p2 = paraTela(topo - Vector3.new(0, 1, 0))
+    if not p1 or not p2 then
+        esconderBarra(info)
+        return
+    end
+
+    if not info.barraBorda then
+        info.barraBorda = novoQuadrado()
+        info.barraBorda.Color = Color3.fromRGB(0, 0, 0)
+        info.barraBorda.Transparency = 0.6
+        info.barraVida = novoQuadrado()
+    end
+
+    local pixelsPorStud = math.abs(p2.Y - p1.Y)
+    local largura = math.clamp(pixelsPorStud * 3, 24, 120)
+    local altura = math.clamp(pixelsPorStud * 0.35, 3, 8)
+    local x = p1.X - largura / 2
+    local y = p1.Y - altura / 2
+
+    local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+
+    info.barraBorda.Position = Vector2.new(x - 1, y - 1)
+    info.barraBorda.Size = Vector2.new(largura + 2, altura + 2)
+
+    info.barraVida.Position = Vector2.new(x, y)
+    info.barraVida.Size = Vector2.new(largura * pct, altura)
+    if info.ultimoPct ~= pct then
+        info.ultimoPct = pct
+        info.barraVida.Color = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), pct)
+    end
+
+    info.barraBorda.Visible = true
+    info.barraVida.Visible = true
+    info.barraVisivel = true
+end
+
+local barraEstavaLigada = false
+
+RunService:BindToRenderStep("VidaTomajack", PRIORIDADE_VIDA, function()
+    if not temDrawing then return end
+
+    if not Config.BarraVida then
+        if barraEstavaLigada then
+            for _, info in pairs(infos) do
+                esconderBarra(info)
+            end
+            barraEstavaLigada = false
+        end
+        return
+    end
+    barraEstavaLigada = true
+
+    camera = Workspace.CurrentCamera
+    local camPos = camera.CFrame.Position
+
+    for _, outro in ipairs(jogadores) do
+        local ok = pcall(desenharBarra, outro, camPos)
+        if not ok then
+            local info = infos[outro]
+            if info then pcall(esconderBarra, info) end
+        end
+    end
+end)
+
+-- ================= ESP (CAIXA, NOME, VIDA E DISTÂNCIA) =================
+local PRETO = Color3.fromRGB(0, 0, 0)
+
+local function novoTextoEsp(tamanho)
+    local t = Drawing.new("Text")
+    t.Size = tamanho
+    t.Center = true
+    t.Outline = true
+    t.Transparency = 1
+    t.Visible = false
+    return t
+end
+
+local function novoQuadradoEsp(preenchido, espessura, cor)
+    local q = Drawing.new("Square")
+    q.Filled = preenchido
+    q.Thickness = espessura
+    q.Color = cor
+    q.Transparency = 1
+    q.Visible = false
+    return q
+end
+
+local function criarEsp(info)
+    info.esp = {
+        sombra = novoQuadradoEsp(false, 3, PRETO),
+        caixa = novoQuadradoEsp(false, 1, Color3.new(1, 1, 1)),
+        nome = novoTextoEsp(14),
+        dist = novoTextoEsp(13),
+        vidaFundo = novoQuadradoEsp(true, 1, PRETO),
+        vidaBarra = novoQuadradoEsp(true, 1, Color3.new(0, 1, 0)),
+        vidaTexto = novoTextoEsp(12),
+    }
+    return info.esp
+end
+
+local function esconderEsp(info)
+    if info.esp and info.espVisivel then
+        for _, d in pairs(info.esp) do
+            d.Visible = false
+        end
+        info.espVisivel = false
+    end
+end
+
+local function desenharEsp(outro, camPos)
+    local info = getInfo(outro)
+    if not info then
+        local antigo = infos[outro]
+        if antigo then esconderEsp(antigo) end
+        return
+    end
+
+    local hum, cabeca, tronco = info.hum, info.cabeca, info.tronco
+    if not (hum and cabeca and tronco and cabeca.Parent and tronco.Parent)
+        or hum.Health <= 0
+        or (Config.EspSoInimigos and outro.Team ~= nil and outro.Team == player.Team)
+        or (tronco.Position - camPos).Magnitude > Config.EspDistancia
+    then
+        esconderEsp(info)
+        return
+    end
+
+    local raiz = info.raiz
+    if not raiz or not raiz.Parent or info.raizChar ~= info.char then
+        raiz = info.char:FindFirstChild("HumanoidRootPart") or tronco
+        info.raiz = raiz
+        info.raizChar = info.char
+    end
+
+    local topo = paraTela(cabeca.Position + Vector3.new(0, cabeca.Size.Y / 2 + 0.2, 0))
+    local base = paraTela(raiz.Position - Vector3.new(0, 3, 0))
+    if not topo or not base or base.Y - topo.Y < 4 then
+        esconderEsp(info)
+        return
+    end
+
+    local esp = info.esp or criarEsp(info)
+
+    local altura = base.Y - topo.Y
+    local largura = altura * 0.6
+    local cx = topo.X
+    local x, y = cx - largura / 2, topo.Y
+    local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+    local corVida = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), pct)
+
+    local mostrarCaixa = Config.EspCaixa
+    esp.sombra.Visible = mostrarCaixa
+    esp.caixa.Visible = mostrarCaixa
+    if mostrarCaixa then
+        esp.sombra.Position = Vector2.new(x, y)
+        esp.sombra.Size = Vector2.new(largura, altura)
+        esp.caixa.Position = Vector2.new(x, y)
+        esp.caixa.Size = Vector2.new(largura, altura)
+        esp.caixa.Color = Config.EspCor
+    end
+
+    esp.nome.Visible = Config.EspNome
+    if Config.EspNome then
+        esp.nome.Text = outro.DisplayName
+        esp.nome.Color = Config.EspNomeCor
+        esp.nome.Position = Vector2.new(cx, y - 17)
+    end
+
+    local mostrarVida = Config.EspVidaLado
+    esp.vidaFundo.Visible = mostrarVida
+    esp.vidaBarra.Visible = mostrarVida
+    esp.vidaTexto.Visible = mostrarVida
+    if mostrarVida then
+        esp.vidaFundo.Position = Vector2.new(x - 6, y - 1)
+        esp.vidaFundo.Size = Vector2.new(4, altura + 2)
+        esp.vidaBarra.Position = Vector2.new(x - 5, y + altura * (1 - pct))
+        esp.vidaBarra.Size = Vector2.new(2, altura * pct)
+        esp.vidaBarra.Color = corVida
+        esp.vidaTexto.Text = tostring(math.floor(pct * 100 + 0.5))
+        esp.vidaTexto.Color = corVida
+        esp.vidaTexto.Position = Vector2.new(x - 15, y - 7)
+    end
+
+    esp.dist.Visible = Config.EspDistTexto
+    if Config.EspDistTexto then
+        esp.dist.Text = math.floor((raiz.Position - camPos).Magnitude) .. "m"
+        esp.dist.Color = Color3.new(1, 1, 1)
+        esp.dist.Position = Vector2.new(cx, base.Y + 2)
+    end
+
+    info.espVisivel = true
+end
+
+local espEstavaLigado = false
+
+RunService:BindToRenderStep("EspTomajack", PRIORIDADE_VIDA + 1, function()
+    if not temDrawing then return end
+
+    if not Config.Esp then
+        if espEstavaLigado then
+            for _, info in pairs(infos) do
+                esconderEsp(info)
+            end
+            espEstavaLigado = false
+        end
+        return
+    end
+    espEstavaLigado = true
+
+    camera = Workspace.CurrentCamera
+    local camPos = camera.CFrame.Position
+
+    for _, outro in ipairs(jogadores) do
+        local ok = pcall(desenharEsp, outro, camPos)
+        if not ok then
+            local info = infos[outro]
+            if info then pcall(esconderEsp, info) end
+        end
+    end
+end)
+
+-- ================= CAMPO DE VISÃO (FOV DA CÂMERA) =================
+-- Igual ao FOV de jogo de tiro: quanto maior, mais você enxerga dos lados. Vai até 120.
+local camFovOriginal = nil
+
+RunService:BindToRenderStep("CamFovTomajack", Enum.RenderPriority.Camera.Value + 1, function()
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+
+    if Config.CamFOVAtivo then
+        if not camFovOriginal then camFovOriginal = cam.FieldOfView end
+        if cam.FieldOfView ~= Config.CamFOV then
+            cam.FieldOfView = Config.CamFOV
+        end
+    elseif camFovOriginal then
+        cam.FieldOfView = camFovOriginal -- desligou: volta ao FOV de antes
+        camFovOriginal = nil
+    end
+end)
+
+-- ================= ESTICAR TELA =================
+RunService:BindToRenderStep("EsticarTomajack", PRIORIDADE_ESTICAR, function()
+    if not Config.Esticar then return end
+    local cam = Workspace.CurrentCamera
+    local y = Config.EsticarValor
+    cam.CFrame = cam.CFrame * CFrame.new(0, 0, 0, 1, 0, 0, 0, y, 0, 0, 0, 1)
+end)
+
+-- ================= ANTI LAG =================
+-- cria um módulo que aplica propriedades em objetos e depois restaura
+local function criarAntiLag(containers, regras)
+    local salvo = {}
+    local conexoes = {}
+    local ativo = false
+
+    local function aplicar(obj)
+        for _, r in ipairs(regras) do
+            if obj:IsA(r.classe) then
+                local orig = salvo[obj] or {}
+                for k, v in pairs(r.props) do
+                    if orig[k] == nil then
+                        pcall(function() orig[k] = obj[k] end)
+                    end
+                    pcall(function() obj[k] = v end)
+                end
+                salvo[obj] = orig
+            end
+        end
+    end
+
+    return function(ligar)
+        if ligar == ativo then return end
+        ativo = ligar
+
+        if ligar then
+            for _, c in ipairs(containers) do
+                conexoes[#conexoes + 1] = c.DescendantAdded:Connect(function(o)
+                    if ativo then aplicar(o) end
+                end)
+                task.spawn(function()
+                    local n = 0
+                    for _, o in ipairs(c:GetDescendants()) do
+                        if not ativo then return end
+                        aplicar(o)
+                        n += 1
+                        if n % 400 == 0 then task.wait() end -- não trava o jogo
+                    end
+                end)
+            end
+        else
+            for _, cn in ipairs(conexoes) do cn:Disconnect() end
+            table.clear(conexoes)
+            for obj, orig in pairs(salvo) do
+                for k, v in pairs(orig) do
+                    pcall(function() obj[k] = v end)
+                end
+            end
+            table.clear(salvo)
+        end
+    end
+end
+
+local antiLagEfeitos = criarAntiLag({ Lighting }, {
+    { classe = "BlurEffect", props = { Enabled = false } },
+    { classe = "BloomEffect", props = { Enabled = false } },
+    { classe = "SunRaysEffect", props = { Enabled = false } },
+    { classe = "ColorCorrectionEffect", props = { Enabled = false } },
+    { classe = "DepthOfFieldEffect", props = { Enabled = false } },
+})
+
+local antiLagTexturas = criarAntiLag({ Workspace }, {
+    { classe = "BasePart", props = { Material = Enum.Material.SmoothPlastic, Reflectance = 0 } },
+    { classe = "Decal", props = { Transparency = 1 } },
+})
+
+local antiLagParticulas = criarAntiLag({ Workspace }, {
+    { classe = "ParticleEmitter", props = { Enabled = false } },
+    { classe = "Trail", props = { Enabled = false } },
+    { classe = "Smoke", props = { Enabled = false } },
+    { classe = "Fire", props = { Enabled = false } },
+    { classe = "Sparkles", props = { Enabled = false } },
+})
+
+local sombraOriginal = Lighting.GlobalShadows
+local qualidadeOriginal
+pcall(function() qualidadeOriginal = settings().Rendering.QualityLevel end)
+
+local function antiLagSombras(ligar)
+    if ligar then
+        sombraOriginal = Lighting.GlobalShadows
+        Lighting.GlobalShadows = false
+    else
+        Lighting.GlobalShadows = sombraOriginal
+    end
+end
+
+local function antiLagQualidade(ligar)
+    pcall(function()
+        if ligar then
+            qualidadeOriginal = settings().Rendering.QualityLevel
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        elseif qualidadeOriginal then
+            settings().Rendering.QualityLevel = qualidadeOriginal
+        end
+    end)
+end
+
+-- ================= SHADER (REALISTA) =================
+-- Só usa efeitos de pós-processamento do próprio Roblox (baratos). Três níveis:
+--   1 leve      : cor e brilho discretos
+--   2 realista  : + profundidade de campo suave, raios de sol, névoa leve e reflexos
+--   3 ultra     : visual cinematográfico, o mais bonito (e o mais pesado dos três)
+-- Tudo é removido e a iluminação volta ao normal ao desligar.
+-- (O "Future lighting" do Roblox não dá para ligar por script: é uma configuração do jogo.)
+local PRESETS = {
+    [1] = {
+        contraste = 0.08, saturacao = 0.10, brilho = 0,
+        bloom = 0.15, bloomTam = 24, bloomLimite = 0.97,
+        sol = 0.04, nevoa = 0.10, haze = 0.10,
+        exposicao = 0, dof = nil, reflexo = nil, sombra = 0.25,
+    },
+    [2] = {
+        contraste = 0.14, saturacao = 0.18, brilho = 0,
+        bloom = 0.25, bloomTam = 26, bloomLimite = 0.95,
+        sol = 0.08, nevoa = 0.16, haze = 0.15,
+        exposicao = -0.05, dof = { longe = 0.10, foco = 160, raio = 100 }, reflexo = 1, sombra = 0.2,
+    },
+    [3] = {
+        contraste = 0.20, saturacao = 0.26, brilho = -0.01,
+        bloom = 0.35, bloomTam = 32, bloomLimite = 0.92,
+        sol = 0.12, nevoa = 0.22, haze = 0.25,
+        exposicao = -0.08, dof = { longe = 0.22, foco = 120, raio = 70 }, reflexo = 1, sombra = 0.12,
+    },
+}
+
+local shader = { efeitos = nil, original = nil, atmosfera = nil }
+
+local function removerShader()
+    if shader.efeitos then
+        for _, e in pairs(shader.efeitos) do
+            pcall(function() e:Destroy() end)
+        end
+        shader.efeitos = nil
+    end
+    if shader.atmosfera then
+        pcall(function() shader.atmosfera:Destroy() end)
+        shader.atmosfera = nil
+    end
+    if shader.original then
+        for k, v in pairs(shader.original) do
+            pcall(function() Lighting[k] = v end)
+        end
+        shader.original = nil
+    end
+end
+
+local function aplicarShader()
+    local preset = PRESETS[math.clamp(math.floor(Config.ShaderNivel + 0.5), 1, 3)]
+    local i = Config.ShaderIntensidade
+
+    if not shader.efeitos then
+        -- guarda o que vamos mexer na iluminação para devolver depois
+        shader.original = {}
+        for _, k in ipairs({ "ExposureCompensation", "ShadowSoftness", "EnvironmentSpecularScale", "EnvironmentDiffuseScale" }) do
+            pcall(function() shader.original[k] = Lighting[k] end)
+        end
+
+        local function novo(classe, nome)
+            local e = Instance.new(classe)
+            e.Name = nome
+            e.Parent = Lighting
+            return e
+        end
+
+        shader.efeitos = {
+            cor = novo("ColorCorrectionEffect", "TomajackShaderCor"),
+            brilho = novo("BloomEffect", "TomajackShaderBrilho"),
+            sol = novo("SunRaysEffect", "TomajackShaderSol"),
+            dof = novo("DepthOfFieldEffect", "TomajackShaderProfundidade"),
+        }
+
+        -- névoa leve: só se o jogo ainda não tiver uma (para não empilhar)
+        if not Lighting:FindFirstChildOfClass("Atmosphere") then
+            local atm = Instance.new("Atmosphere")
+            atm.Name = "TomajackShaderNevoa"
+            atm.Parent = Lighting
+            shader.atmosfera = atm
+        end
+    end
+
+    local e = shader.efeitos
+
+    -- cor: contraste, saturação e um tom levemente quente
+    e.cor.Contrast = preset.contraste * i
+    e.cor.Saturation = preset.saturacao * i
+    e.cor.Brightness = preset.brilho * i
+    e.cor.TintColor = Color3.fromRGB(250, 245, 240)
+
+    -- brilho suave nas partes claras
+    e.brilho.Intensity = preset.bloom * i
+    e.brilho.Size = preset.bloomTam
+    e.brilho.Threshold = preset.bloomLimite
+
+    -- raios de sol
+    e.sol.Intensity = preset.sol * i
+    e.sol.Spread = 0.75
+
+    -- profundidade de campo: desfoca só o que está bem longe (nível 2 e 3)
+    if preset.dof then
+        e.dof.Enabled = true
+        e.dof.FarIntensity = math.min(preset.dof.longe * i, 0.6)
+        e.dof.FocusDistance = preset.dof.foco
+        e.dof.InFocusRadius = preset.dof.raio
+        e.dof.NearIntensity = 0
+    else
+        e.dof.Enabled = false
+    end
+
+    -- névoa atmosférica
+    if shader.atmosfera then
+        local a = shader.atmosfera
+        a.Density = preset.nevoa * math.min(i, 1.3)
+        a.Offset = 0.2
+        a.Color = Color3.fromRGB(165, 175, 192)
+        a.Decay = Color3.fromRGB(88, 94, 106)
+        a.Glare = 0
+        a.Haze = preset.haze * math.min(i, 1.3)
+    end
+
+    -- iluminação: exposição, sombras suaves e reflexos
+    if shader.original then
+        pcall(function()
+            Lighting.ExposureCompensation = (shader.original.ExposureCompensation or 0) + preset.exposicao * i
+            Lighting.ShadowSoftness = preset.sombra
+            -- só os reflexos (a luz geral não muda, para não esbranquiçar)
+            if preset.reflexo then
+                Lighting.EnvironmentSpecularScale = preset.reflexo
+            else
+                Lighting.EnvironmentSpecularScale = shader.original.EnvironmentSpecularScale or 1
+            end
+        end)
+    end
+end
+
+-- =====================================================================
+-- ======================= INTERFACE FUTURISTA =========================
+-- =====================================================================
+-- (os nomes Ciano/Magenta são antigos: agora são o vermelho e o laranja-sangue)
+local T = {
+    Fundo = Color3.fromRGB(7, 6, 6),
+    Painel = Color3.fromRGB(14, 13, 12),
+    Elemento = Color3.fromRGB(22, 20, 18),
+    Hover = Color3.fromRGB(40, 35, 29),
+    Ciano = Color3.fromRGB(196, 160, 98),    -- dourado champanhe (menos amarelo)
+    Magenta = Color3.fromRGB(234, 212, 168), -- champanhe claro do degradê
+    Texto = Color3.fromRGB(240, 236, 228),
+    Dim = Color3.fromRGB(150, 135, 110),
+    Off = Color3.fromRGB(52, 47, 40),
+    -- fonte das opções (troque aqui: GothamBold, GothamBlack, SourceSansBold, Michroma, Bangers...)
+    Fonte = Enum.Font.GothamMedium,
+    TamanhoTexto = 13,
+}
+
+local function criar(classe, props, parent)
+    local obj = Instance.new(classe)
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+    obj.Parent = parent
+    return obj
+end
+
+local function cantos(obj, px)
+    -- cantos quase retos: o raio pedido vira ~1/3
+    return criar("UICorner", { CornerRadius = UDim.new(0, math.floor((px or 8) * 0.35)) }, obj)
+end
+
+local function borda(obj, cor, transp, espessura)
+    return criar("UIStroke", {
+        Color = cor or T.Ciano,
+        Transparency = transp or 0.5,
+        Thickness = espessura or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, obj)
+end
+
+local function neon(parent, rotacao)
+    return criar("UIGradient", {
+        Color = ColorSequence.new(T.Ciano, T.Magenta),
+        Rotation = rotacao or 0,
+    }, parent)
+end
+
+local function tw(obj, tempo, props)
+    TweenService:Create(obj, TweenInfo.new(tempo, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local function texto(parent, props)
+    local base = {
+        BackgroundTransparency = 1,
+        Font = T.Fonte,
+        TextSize = T.TamanhoTexto,
+        TextColor3 = T.Texto,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }
+    for k, v in pairs(props) do base[k] = v end
+    return criar("TextLabel", base, parent)
+end
+
+local function ehClique(i)
+    return i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch
+end
+
+local function ehMovimento(i)
+    return i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch
+end
+
+-- arrasta na horizontal e devolve a posição X do mouse/dedo
+local function arrastavel(zona, aoMover)
+    local ativo = false
+    zona.InputBegan:Connect(function(i)
+        if ehClique(i) then
+            ativo = true
+            aoMover(i.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if ativo and ehMovimento(i) then
+            aoMover(i.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if ehClique(i) then ativo = false end
+    end)
+end
+
+-- ---------- janela ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "TomajackHub"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+do
+    local ok = pcall(function()
+        gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok or not gui.Parent then
+        gui.Parent = player:WaitForChild("PlayerGui")
+    end
+end
+
+local main = criar("Frame", {
+    Name = "Main",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(580, 420),
+    BackgroundColor3 = T.Fundo,
+    BackgroundTransparency = 0.04,
+    BorderSizePixel = 0,
+}, gui)
+cantos(main, 10)
+local escala = criar("UIScale", { Scale = 0.92 }, main)
+
+local contornoMain = criar("UIStroke", {
+    Color = Color3.new(1, 1, 1),
+    Thickness = 1.5,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, main)
+local gradContorno = neon(contornoMain, 0)
+
+-- brilho suave de fundo (degradê escuro)
+criar("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(30, 26, 22), Color3.fromRGB(5, 4, 4)),
+    Rotation = 90,
+}, main)
+
+-- ---------- LOGO HIVE (logo + marca d'água) ----------
+local tigreAsset
+do
+local TIGRE_PNG = table.concat({
+    "\137PNG\013\010\026\010\000\000\000\013IHDR\000\000\001@\000\000\001@\008\003\000\000\000\250NU\152\000\000\000\144PLTE\232\218\171\167\140U\231\213\174\223\204\166\145vG\254\253\243\199\169s\162\132P\157\144\000' \021\230\213\178\206\186\150\255\000\000\231\166\149gT5\168\137T\155\151\128\154zM\255\255\000H:$\167\142c\203\153f\144q<\132kB\255\170\000udD\128\000\000\153f\000\153|J\240\224\192\188\167\129\197\175\134\186\168\133\196\176\137\142t?\000\000\000\012\012\012\165\136T\208\184\134\196\168r\180\153f\151yF\238\216\180\218\195\145\177\147]\188\162o\241\226\193\169\135Q\218\237\130<\000\000\0000tRNS\027\027\248TV\002\252\245\002\255\165X\001\017\255\157\0052\001\255^\005\255\255\003\255\002\005\134\221b\240\255\135u\000\255\253\253\253\253\253\017\253\249\253\247\020t\183;\197\000\000\018vIDATx\218\237\157\011c\155:\018\133\007'\024;66~tS7m\186\221\212/l\167\255\255\223\173\164\145@\216\128yI\016<s\219&\233m |\158s4\146a\004\031\020\181\002\008\001\001$\128\004\144\000R\016@\002H\000\009 \005\001$\128\004\176\185\152N\151\034\166S\002X\030\222\210e\017\004\190\031\004\252\179\229\148\000\150\163\023\248\000\174\012\000\008\186\202\176\139\000\025>\031857\020!>\005\159!$\128\197\240q^\002\158\248\020?\003\241\233\146\000\222S/f\159+\242\206\013\001B\192\207\004\194\014f!t\205\252$>F\142\131c9\024\002~\013\018a\199\172\016\186\165\222@\226\227\244\240\003~\021\253\165\203\134\147%\001\2046?F\008u\027\242\143*B\252K\246K\252\147.!\132\142\1697DR:=\197\016\017\134h\133S\002x\141\015\213\235\138\236\139\240=\177\208\210\208E-w\201\010\161c\230'j\150\024\158\010\1370Do\236\146\021BW\010g\169PH\226{\249\245\235%\137\176kV\008\2211?7\242\186\024\223'\139\004\194P\242\235\140\142\161+\234UC\132\134o\240)#\005!tE\199\208>>\144E\222\021\190\023\142n\192\130\127|\185B\216\157\170\016Z\159\183\197\230\167\241{A\245\014\006\138\224/\137P\013&\1780\132\214gw\208\005\243\019<\018\248\0061>\133p\144HBA\188\011%\013t\192\252\226\210E7\191A\034n\017v\196\010\161\245y[\182\249\221\034L\179B\192\245\214\229C\001\148\139V\225\029\243KK\194\151+\029\183=\187\131v+\191+\243KU\239=+lwv\007\237.Z\2217\191\187V(\215\013\219\178Bh\199\252d\217\156a~\167\140\200\176\1940Z\251j\161\164\1296\213\027\166\150.\167\156H\181B\201\175\029\029Ck\243\182\012\245\158\238D\134\142[+i\192~\233\1467o;\021\136\028\029\135\246K\026hg\2019E\189\005\241\197\008\007:B\149\132\214u\012\022\249\001\164\16972\191S\137\200\182B|\027\222\030A\176V:\007\224B\154z+\224\211\017\166\172\210\008'\156\246\011 \207?\228\167\210\175\130\249\221\181\194\168\162a'[\246\011\160\224\007\215\165_i\243\203\179Bm0\177I\016,\009\216w\181\203\187Q\239\142\007\254Y\230c\138\142\213\025\216\009\167=\002\184\012",
+    "\164Ci\252\034|\187\026\145D\024\017\228\167\009\150\253\0018e\138b5\140\228\1510\191S-~1BM\199\220\005\217\226\012\216IA\176\149\128\209[\150q\250\013j\166_Dp\144H\194\016\151\008-\165\160\021\128\204\144\220P\203\191F\212\155\161ce\181,\229\221\254\000\148w\155\034\191H\189\187\198B\2151\018\020\167\236\019@U\255\201w\203\027\197\023#\228o \199\147\146\222\000\092\250x\151\031\242C\243\2195\030\210\010\145\160HB\127\217\019\128\174\239\135J\193/&\210OO\194\023\165\225\208\183b\130v\000*\005\139\004,\131o\1278\236\203 \228\000\159\148\134\251\003\016\212}\004\008\1760\144\225\229\184Z\029/\195\2262\150\000\249\201|;&h\005\160[\013\224\197\155\141\255\254\029\207\188K\021\128\172\026\236\015@\023\202\003\220\011|<\024\194}y\128\2529\167\254\000\196\149\232\167\226\000\247\135\141\196'\016n\138Y!\002|\194\217H\159\000\202AX\001\028\222\139\253\225\168\225\019\008\143\135\253\221o\211\001\178S\246\010 \148\000\184\191D\234\213\0082+\220\151\000(\030\210\233\015@(\158\129\169\248\138!Ld`\159\001\238s\226\1460\191+\132\155\195%\239{\009\224\254\214\252\174\016\190\030\008`\014\192\195q\150\203\143\017\092\029\015\0040K\189\222=|\145\021\018\1924|\155\002\248\208\0103\016>6@\175 >\172\010\009\224Ml\254\150\000\184!\128\004\144\000~e\128\179\212C\012\031\005\224%-\202\001L=\196\158\000\018@\002h\001\224\158\000\018@\002\248\165\001\030\210\162\028\192\212C\016@\002H\000\009\224#\003\188\016@\002H\000[\0038#\128\004\208\018\192\011\001$\128\004\144\000>2\192sZ\148\003\152z\136C\255\001N\008\1601\128\175\227\194\183&\140\199\155l\128\147G\005xf\183\022\141\139\225\155\029\207\015\013\240\176\205\136c\177\187\179\142Y\223\223c\128\170QB>\192\237\246uu\247\254\192M\246w\199\000\197\227^\189\001\200\246\245\145\000'\247\000n\243u\204\212\155\243\189\018\224D\002d\187\009\245\004\160\207B\244\139\157\220\007(t<\2066\191m\017\128x6\022\189\0008\253\161\154\225\023\003\152\137\240\030\190\008\224\196\151\231\131\031\211\175\015p:\026\2492&\028\224\224>\192T+\2045\191+\128\019u\198\209\200\248\150j`\028\223\247\183\1604\192\027+d\234\245\182\165\001:\163\239\012\225\023\0068\2531\026\141\028'\248\230\004%\001&u<\190\175\222[\128\129\243-p\028\246\003\152\2131\152\220\152\144\253\244o\129\243\207\017\017\172\223\223\223\231\131\162\000\181\170p\188z-\246\029\002\224\156\157f\237\168\008F\134\017\130Q\245\142X\014\252\251\135\004\215<\202\000\220z\194\010\199\171\034\234\213\000\138\019\137S\138S\007oFu\012&\241\241K\016\191\020\192\249\156\247**\010\016u\092L\189\008\144\181M\248=\143\008\170s\007&\173\016L\154\159\147\196\199\001\138[q\207\133\145l\189\226\248\182gqp\009p-S\016\207oN\199`\208\2520\255t~\158|L\171x\014\150\008ulO#\136/!K\194\197\200PI\003\006\205/\246\191\231\245\250\249y>\247\134,\251\206f\016\010|C~\244\1617\159?\179X/\148\015\2543\168c0",
+    "\164^L>\129o\241,\130\165\223p?\220\206f\155\179\212\177\215X(|\175\179\025{\145\134\012!\158s\177\136t\204~\020#\008\193\000\190E \197\147\192w\022\248\216\184\202\151\243\196\195q\219m\163\252\206\188\238\225\203\013\028\165B\024\235\216\144\021\130\129\137Gl~\139\005\242\251\137\234U\149\029C8D\029{\199\218\255\169\244\219\170\131\175^\207,\009\207\243\159*\011\023\034\009\177\164i\220\010\193\136\249\253K\224c\233\199\158\228?k\203\165\152'\002\225\177fD\248\226\2333\166\184\166\227\133tc\019V\0086\204\015\213\155\152\221\138<\017\194\243\234\224\243\240u8_\173e\179\215'a\133N\194\010GM\034\132&K\023a~h7Q\246\253\156s|\231\205\205\250\138\178\194:I\168\153\223\245\218\205L\2328\137\016]9h\212\010\193\140\2499\154\249\013\211\1740\202\147\026\008c\243\027\167\174\030\162\142\127&u\220\244\236\014\154\158\183\233\248\158E\229|\206|\146\159\229\201\182\178\142\1893\150.\179\172\183Q\004\194\161i+\004\019\2436'2\191\204\004\137.RZa\233$\220^2\212\155|\007e\184\191\214\177f\133M\232\024\026\156\183%\135^i~\247\222g\171f\133\210\252\238u\169PV8Od\161\180\194ffw\208\240\188-\187t\201\207\0191\137-\172\222<\243\187c\133M\207\238\192`\233r\222\206\138\221j\192\243\004\005Y,\253\228\188mU\236\232\188j\031\030L\205\238\160f\250\009\245F\178pn\230mEo\022R\179\187\026\165K^\138\011\189'fw\255\180U\154\182\000r~\217\243\182\215\213\184\212\253V\199B%\141\196\183\157\149:x\250\236N\234\184\030A\168#_\225~w\231m\165\242\228\142\142\2077\243\1822)~S\210\136$dEa\141\225\184\006@Q:\139\193\163\092\233\146\155'X\210\252'5\142\146\240\235\170\252\193y\199(,i\254\167\1514\2267'h\031\224\148\207\220\212*\135\170\156\231X\186\204\170\092a\178\164I\195W\214\252\210\170\246\228B\151\252\249\023\223\171\171\024\234\248_\204/m\209\170\026B\015\173\240\134\224\177x\233\146_\181\199%MT\209\212\241\193\026\000\131\184v\142\213{\246j\224K\204\238\142\183\234\173\158\219\169\179\187\184\162\225\004\237\002\228\002\150/\224\194\201^\180\170\134\240U\14941\190K-\245f\206\238\156h,\169,\226\138\000\151\034\001y\253\135\252\230\197\230m%\173\208C~^\177y[\225\020\215fw\206B\190k7\026-\173\002\228\171/\242\029\195\026\165\203\253\217\221\177\017\243\203\209\177Z\192d\023d\023\160\092\127\017\227G\169y[\137<\193\146\025\205o\179j\242\232bv\135\008e5S\217\004+\003To\250>\175\231\013\153_\186\142\0272\191\180\170\157\233x\253\172\230\161v\001\142\190\171\233/\187\221`X\181\182-\144'\195\242\243\182\162)\190\017%\013\222D\131\195\136=\128\211\145\031\200\025\200z\2375\159 z\1584\159\219\009+\092\171q$\240\171\141\1955\001.\152\001\238\183\179\191\134\130\245J\029\030\199\166\142\206_\1589wAQ\010\218\005(k\0246\004\207\015\251\237\202\024\192\217~\248\250\215\216\209\021@\225\131\129m\128\152\128\207\243\243W\006x\158\203q\2166@\031",
+    "\139\152^\000\092`=\230\183\001\208\233K\006Z\007\248\013\199\144\231>\000|\198k\249F\000\009 \001$\128\004\144\000\018@\002H\000\009 \001$\128\004\144\000\018@\002H\000\009 \001$\128\004\144\000\018@\002H\000\009 \001$\128\004\144\000\018@\002H\000\009 \001$\128\004\144\000\018@\002H\000\009 \001$\128\004\144\000\018@\002H\000\009 \001l\001`\223\030\245\250\214\194\179r\139~<l\184h\225Y\185@uL\160\199]k?pm\020\224\166\183\015\092\007\216t\226\217\244#\255\167\221\209<@\209z'h\169g\130h:\1772\211\215`|\024\1768\024:\184\232\2028\023\207[\219n:\129mOT\219\024C\141IX\250\013d\152\232;\193:\130\176\190'\222ZY \027D>\236\001\148\163\008OA\214\247dh\1605\014\179\191\221 \138\221fl\160\231\137\232h\025\181\031\171\216}\172N\235'9\014\175\231\1627d\179\008g\255\029$\226\1913\019\248\214\237\181~\226\205\199T%#{\183m\155k_4\246\0067\225\141\155kZ\196[\155\029D\2556\185\217\136\245\230c\162\253\157\163\183o;7g\133l\236\029\164E3V\136\230\0237oS\189|\151\150\0270~\143\218\224\170\006\140M\233X7?\140SsV\024\245\190\251\169\247Q\181\223\128\241#j\161\026\017\252\217\012\194\213AQ;Ey\024\127z\153\213\198\199\127\200y\220\003T\092\132\253\022\160\188\007\232\155\227\164\245\240\173e\133\145\249i\248\146_\214\176Bi~:>Y\140\189\217oB+\218HG[8$\186HW\183\194\241\230\020\241J\009\249\255\170\234\152u\008>_\237\019$\127\250\183\022\218 \127|\252\016}h\213\222\139z\027\248\170:\158\253N\193\151\248RZ\225l\092\195\252\230\201^\230\184[\218\143i;\173\224\223\226\141\028\022u\017*\243;\229\006\254\155\195\172<>\209\189\247\186\155\190hd^\171\155>|\212#\152\182\151C\021+\212\205\175\000\193rV\200\155S\015\181\253\028\162=#\157\250\251+\213\222\014#}+\165a9+\140\230m\167\002Q\186\164\1856\191h'\130&v\006\130\1346a\190\221\204\171\132\142\213\188\237T0J\205\238r\247\180ykwC\150\220\237\228\010#\028\031\202\225\211\172pU\193\252\156\228\174Ju7\166\130\23074LZ\225\189\006\208j\209\234T2\010\205\238\178\204\175\193-\014\161\177-5\179v\149\203\181\194R\230W\218\0103\204\175\209\157\229\160\161m!3\2475\204\213qY\243\211cw\207\010\243\205\175\169m^\161\225\1575\157\018V\168J\151\211nW\137\224.\207\010\217\230![m\218klwM0\182\183kl\133\251T+T\139V\012D\245\144\135\184\181B\243\230\215\252\246\184\217V\1522A\142\204oW3R\173P\152\159\157\029\134\027\220\160\185\140\021\206.\131\250\233\151@\168-t\2171?\019[\132\023\181B\205\252\154\136Sbv\135\230\183O5?\003\187\172\155\216\164^\237\150\149\180\194\003ZaC\230\151i\133\171;;\186\142:\189I}\142\021\174\213\004\185)\243K\183Be~s\011\219\171\155\001\152b\133\188c\252\154m<\034\016\026\193\167!D|\236t\207k\181\231\148\025\2433\006P\234x\145X\232",
+    "Z\139\152\207\135\187\166\213{\173c>\241\192\1799f\205\207 \192\180\170P\017<\153\194\167\016\238\230\026?\147\230g\020\160\190q\179\028K8\194\247\201\0313\242\213e\252\231\253\253]\166\159c\210\252\012\003\212\173\016\009\006\239\147\201\228\207\203\224\211$\192\207\193\203\031v\154w\199\137\022\157M\153\159i\128\009+t\190\005\190?\225a\030\1608\141\239\007\2346nS\230g\030 .\2493+\244e\220\000\028\014\155\249\173\001\252|A~<\216]\160\142I\245\154\007\168\172P\092\014\192\019\011\029\224\176\177\208\001\242\179\000\008\128\230\241\025\007(\172\016\241\129 (\001\014\141\132\002(N\198\000\250&\205\207\018@n\133\236b \001P]\240\190\161H\005\008~\000\166\211\207\010\192\143\015\150\128a\024j\000\249%\227\239f\248\169\227i\000\217\009C\223\183pq6\000\006~\008\130 \007\248)\000\154\137\024 ?]\024\004=\001\232\186n\018\224\208\002@\000v\218\190\002\180\147\129\004\144\000\018@\002H\000\009 \001$\128\004\176K\000q*\183\1914\030|N\247(\000/\134bO\000\009`\017\128\191\009`=\128{\002\216\024\192C\003\241\128\000\015M\177KR<<\014@CA\000\009`\187\000/\252\141u\002H\000\009 \001$\128\028 \244\021\224\133\000\018\192\182\000N\204\003\156<\024\192\243\185\153\143\143\006\240\220xp\130\004\144\000\022\003x6\018\143\0030\186\228-\251\213\192\239\136\224\227\001l$\030\014\224\129\000\214\004\1845\020\008p\130\183\248\246\014\160\184\203\220\006@q\143y?3\208\002\192\207\023\153\128\004\144\000\234\000C\203\0009\193~e \160\007>\153\007\136\207\217\240\187\244\251\004\144?)b\021 \132~\159\000B\008\242Q\165\151_\159'\011\000C\241\130\245\006\160|\244J\000\252\180\146\129\152\240\189\001\232\187\161\026\134Y\006\154\006(\007\225\208\013z\006P\140\034\204\003\217\187Jf\248\241\027\019\016 \244\011\224\146\249\185\143\000\225\137_d~\018z^\254\199\204\244\227\135\030\200!$\244\193\013\150=\001\248\129U\140\026F\004\193\221!\149\156W RI\030v\226\149QC\136\240@\027\252l\002\140\030\186\198T\217\221\224+\019W\223\140\248\006\209\195\214\2083\128\190+\135\225\232\169k~\185\023\153sIz\199\220H2\148\249x\025\252\226\199S\015\171\135\194q\237(\216\014\192\165H\193\136 [p\018\008\007\172\034\188J\172c\129\184NF4?\166^\092\200\138\020\236\246\007\224\212\245Ui\1349\024!\220\157\139\131K\007y\022\234\029\008|R\191\130\031\203\250\143\222\000\252X\006\188\009\132\166b\236 \195\175\252\247\182\026>D\184\253\141G\225\221b\158\162\252\011\217\204\017\236(\216\018@LA_\001\0202\142\016^\170\003T\230\199\143\166\134\015\201\207w\167=\002\200\0920\141\224DYa5\132\135S\164\222\1376\252J~v\018\208\022@N\144\141\196~\236\132\216J\139O\237DIS\030\223v\023\141\029\2368~T\1880\171\224\006h\137\1595\128S>\018\235#\201\149\142\127\151D\168\155_\172^u\002\198o\2183\128\156\160\031\173\202\200\152L4\132\165t,\231m\216\170m\002\160\249\159]~\246\000r\021\007\224b\149\027B\170\021\1505\191\201",
+    "\149\249a\001\013\1295\253\218\005\200\008b\018\250\154\142+X\225VV~\178S`\204\143\187\031O?\155\252\172\002\196$D\155\215g\199\152\132\002\225\254\174\142\189}\138\249Ek\021`7\253\172\003\228N\200u\028\173\015\166XaE\243\003\254.\028\1997\253\2323@^S3\029_[\225D\183\194m1\243\139\213\027\162z]\174\222\169\237\235\177\0140a\133\225\181\021\014\242\172\208K7?h\199\252\218\003\024Y!hV\024\247\168\021\179\1874~\023\205\252&\237\155_\155\000u+\132\130V\152c~\208\138\249\181\010\176\128\021&u\172J\151\014\153_\203\000\243\170\194\023\185\230\239]\153\223 \171\242kI\189-\003\212\1720\204\183\194\132\249\249~G\204\175\003\000\149\021B\174\021v\213\252\186\0000\182B?z\227\248\026\225 \205\252d\233\210\170\249u\003`\170\021\250\250\0049^\243K\169\252\218Uo7\000j\019d\205\010AO\194n\154_w\000\234V\024g!\200$\196\021\251\009\248\215\230\231\183l~\029\002\152a\133B\201\226\013<?\022/\170\215\239\128\249u\010`zU\152\018\0292\191\142\001L\181\194kx\248\247.t\007_\151\000\226\187&\202\010\195[|\0293\191\238\001LL\144\245\005W\237\013\143\014\153_\023\001\010\029\251jr\167\002\212\159\2212\191n\002\140\172\016\215h$A\245%t\014_\007\001bU\200\199\138\016\239\005\225wj\132\174\1967\253 \128E\017\010f\174x\202I|\193\240-;\248\195v\017\160@\136f\008\200\143Y_\023\179\175\187\000\185\023.]-:\153|\221\006(7U\227\209\233\031\177\219\000\191@\016@\002H\000\009 \001\164 \128\004\144\000\018@\010\002H\000\191\092\252\031$\177\008\173W5M\207\000\000\000\000IEND\174B`\130",
+})
+
+-- se você colocar um arquivo "hive_logo.png" na pasta workspace do executor, ele vira a logo
+if isfile and readfile and getcustomasset then
+    pcall(function()
+        if isfile("hive_logo.png") then
+            tigreAsset = getcustomasset("hive_logo.png")
+        end
+    end)
+end
+if not tigreAsset and writefile and getcustomasset then
+    pcall(function()
+        writefile("hive_hex_champ.png", TIGRE_PNG)
+        tigreAsset = getcustomasset("hive_hex_champ.png")
+    end)
+end
+
+if tigreAsset then
+    criar("ImageLabel", {
+        Name = "LogoFundo",
+        AnchorPoint = Vector2.new(1, 1),
+        Position = UDim2.new(1, -14, 1, -34),
+        Size = UDim2.fromOffset(270, 270),
+        BackgroundTransparency = 1,
+        Image = tigreAsset,
+        ImageTransparency = 0.75,
+        ZIndex = 0,
+    }, main)
+end
+end
+
+-- barra do topo
+local topo = criar("Frame", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundTransparency = 1,
+}, main)
+
+if tigreAsset then
+    criar("ImageLabel", {
+        Position = UDim2.fromOffset(10, 5),
+        Size = UDim2.fromOffset(34, 34),
+        BackgroundTransparency = 1,
+        Image = tigreAsset,
+    }, topo)
+end
+
+local titulo = texto(topo, {
+    Position = UDim2.fromOffset(tigreAsset and 50 or 16, 0),
+    Size = UDim2.fromOffset(300, 44),
+    Text = "H I V E    S E R V I C E S",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = Color3.new(1, 1, 1),
+})
+neon(titulo, 0)
+
+
+local linhaTopo = criar("Frame", {
+    Position = UDim2.fromOffset(0, 44),
+    Size = UDim2.new(1, 0, 0, 1),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, main)
+criar("UIGradient", {
+    Color = ColorSequence.new(T.Ciano, T.Magenta),
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0.1),
+        NumberSequenceKeypoint.new(1, 1),
+    }),
+}, linhaTopo)
+
+local botaoMin = criar("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -12, 0, 22),
+    Size = UDim2.fromOffset(28, 24),
+    BackgroundColor3 = T.Elemento,
+    Text = "–",
+    TextSize = 18,
+    Font = Enum.Font.GothamBold,
+    TextColor3 = T.Texto,
+    AutoButtonColor = false,
+}, main)
+cantos(botaoMin, 6)
+borda(botaoMin, T.Magenta, 0.6)
+
+local botaoFechar = criar("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -46, 0, 22),
+    Size = UDim2.fromOffset(28, 24),
+    BackgroundColor3 = T.Elemento,
+    Text = "✕",
+    TextSize = 13,
+    Font = Enum.Font.GothamBold,
+    TextColor3 = Color3.fromRGB(255, 90, 110),
+    AutoButtonColor = false,
+}, main)
+cantos(botaoFechar, 6)
+borda(botaoFechar, Color3.fromRGB(255, 60, 90), 0.6)
+
+-- barra lateral
+local lateral = criar("Frame", {
+    Position = UDim2.fromOffset(10, 54),
+    Size = UDim2.fromOffset(120, 326),
+    BackgroundColor3 = T.Painel,
+    BackgroundTransparency = 0.45,
+    BorderSizePixel = 0,
+}, main)
+cantos(lateral, 8)
+borda(lateral, T.Ciano, 0.92)
+criar("UIListLayout", {
+    Padding = UDim.new(0, 6),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, lateral)
+criar("UIPadding", {
+    PaddingTop = UDim.new(0, 8),
+    PaddingLeft = UDim.new(0, 8),
+    PaddingRight = UDim.new(0, 8),
+}, lateral)
+
+-- área de conteúdo
+local conteudo = criar("Frame", {
+    Position = UDim2.fromOffset(140, 54),
+    Size = UDim2.fromOffset(430, 326),
+    BackgroundTransparency = 1,
+}, main)
+
+-- rodapé
+local rodape = texto(main, {
+    Position = UDim2.fromOffset(16, 388),
+    Size = UDim2.new(1, -32, 0, 24),
+    Text = "H  Aimlock     ·     RightShift  Ocultar menu     ·     v1.0",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    TextColor3 = T.Dim,
+})
+
+-- ---------- notificações ----------
+local notifFrame = criar("Frame", {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -16, 0, 16),
+    Size = UDim2.fromOffset(250, 320),
+    BackgroundTransparency = 1,
+}, gui)
+criar("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    HorizontalAlignment = Enum.HorizontalAlignment.Right,
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, notifFrame)
+
+local function notificar(tituloTxt, corpo, duracao)
+    local item = criar("Frame", {
+        Size = UDim2.fromOffset(250, 52),
+        BackgroundColor3 = T.Painel,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, notifFrame)
+    cantos(item, 8)
+    local s = borda(item, T.Ciano, 1, 1)
+    local barra = criar("Frame", {
+        Size = UDim2.new(0, 3, 1, -12),
+        Position = UDim2.fromOffset(6, 6),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, item)
+    cantos(barra, 2)
+    neon(barra, 90)
+    local l1 = texto(item, {
+        Position = UDim2.fromOffset(18, 6), Size = UDim2.new(1, -26, 0, 18),
+        Text = tituloTxt, Font = Enum.Font.GothamBold, TextSize = 13, TextTransparency = 1,
+    })
+    local l2 = texto(item, {
+        Position = UDim2.fromOffset(18, 26), Size = UDim2.new(1, -26, 0, 18),
+        Text = corpo, TextSize = 12, TextColor3 = T.Dim, TextTransparency = 1,
+    })
+    tw(item, 0.25, { BackgroundTransparency = 0.05 })
+    tw(s, 0.25, { Transparency = 0.5 })
+    tw(barra, 0.25, { BackgroundTransparency = 0 })
+    tw(l1, 0.25, { TextTransparency = 0 })
+    tw(l2, 0.25, { TextTransparency = 0 })
+
+    task.delay(duracao or 3, function()
+        tw(item, 0.3, { BackgroundTransparency = 1 })
+        tw(s, 0.3, { Transparency = 1 })
+        tw(barra, 0.3, { BackgroundTransparency = 1 })
+        tw(l1, 0.3, { TextTransparency = 1 })
+        tw(l2, 0.3, { TextTransparency = 1 })
+        task.wait(0.35)
+        item:Destroy()
+    end)
+end
+
+-- ---------- abas ----------
+local abaAtiva
+local ordemAba = 0
+
+local function novaAba(nome, glifo)
+    ordemAba += 1
+    local aba = {}
+
+    local botao = criar("TextButton", {
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = T.Ciano,
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        LayoutOrder = ordemAba,
+    }, lateral)
+    cantos(botao, 8)
+
+    local marca = criar("Frame", {
+        Position = UDim2.fromOffset(0, 8),
+        Size = UDim2.fromOffset(3, 20),
+        BackgroundColor3 = T.Ciano,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, botao)
+    cantos(marca, 2)
+
+    local rotuloAba = texto(botao, {
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -14, 1, 0),
+        Text = glifo .. "  " .. nome,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = T.Dim,
+    })
+
+    local pagina = criar("ScrollingFrame", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = T.Ciano,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Visible = false,
+    }, conteudo)
+    criar("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, pagina)
+    criar("UIPadding", {
+        PaddingTop = UDim.new(0, 2),
+        PaddingRight = UDim.new(0, 8),
+        PaddingBottom = UDim.new(0, 6),
+    }, pagina)
+
+    aba.botao, aba.marca, aba.rotulo, aba.pagina = botao, marca, rotuloAba, pagina
+
+    local function selecionar()
+        if abaAtiva == aba then return end
+        if abaAtiva then
+            abaAtiva.pagina.Visible = false
+            tw(abaAtiva.marca, 0.2, { BackgroundTransparency = 1 })
+            tw(abaAtiva.botao, 0.2, { BackgroundTransparency = 1 })
+            tw(abaAtiva.rotulo, 0.2, { TextColor3 = T.Dim })
+        end
+        abaAtiva = aba
+        pagina.Visible = true
+        tw(marca, 0.2, { BackgroundTransparency = 0 })
+        tw(botao, 0.2, { BackgroundTransparency = 0.9 })
+        tw(rotuloAba, 0.2, { TextColor3 = T.Texto })
+    end
+    botao.MouseButton1Click:Connect(selecionar)
+    aba.selecionar = selecionar
+
+    local ordemEl = 0
+    local function caixa(altura)
+        ordemEl += 1
+        local f = criar("Frame", {
+            Size = UDim2.new(1, 0, 0, altura),
+            BackgroundColor3 = T.Elemento,
+            BackgroundTransparency = 0.25,
+            BorderSizePixel = 0,
+            LayoutOrder = ordemEl,
+        }, pagina)
+        cantos(f, 6)
+        local s = borda(f, T.Ciano, 0.8)
+        f.MouseEnter:Connect(function()
+            tw(f, 0.15, { BackgroundColor3 = T.Hover })
+            tw(s, 0.15, { Transparency = 0.4 })
+        end)
+        f.MouseLeave:Connect(function()
+            tw(f, 0.15, { BackgroundColor3 = T.Elemento })
+            tw(s, 0.15, { Transparency = 0.78 })
+        end)
+        return f
+    end
+
+    function aba:Secao(nome)
+        ordemEl += 1
+        local l = texto(pagina, {
+            Size = UDim2.new(1, 0, 0, 20),
+            Text = string.upper(nome),
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
+            TextColor3 = T.Dim,
+            LayoutOrder = ordemEl,
+        })
+        return l
+    end
+
+    function aba:Toggle(nome, inicial, cb)
+        local f = caixa(38)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 0),
+            Size = UDim2.new(1, -70, 1, 0),
+            Text = nome,
+        })
+        local sw = criar("Frame", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -12, 0.5, 0),
+            Size = UDim2.fromOffset(40, 20),
+            BackgroundColor3 = T.Off,
+            BorderSizePixel = 0,
+        }, f)
+        cantos(sw, 10)
+        local knob = criar("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 3, 0.5, 0),
+            Size = UDim2.fromOffset(14, 14),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, sw)
+        cantos(knob, 7)
+
+        local estado = inicial and true or false
+        local function aplicar(animar)
+            local t = animar and 0.18 or 0
+            tw(sw, t, { BackgroundColor3 = estado and T.Ciano or T.Off })
+            tw(knob, t, { Position = estado and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) })
+        end
+        aplicar(false)
+
+        local clique = criar("TextButton", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Text = "",
+        }, f)
+        clique.MouseButton1Click:Connect(function()
+            estado = not estado
+            aplicar(true)
+            cb(estado)
+        end)
+
+        return {
+            Set = function(v)
+                estado = v and true or false
+                aplicar(true)
+            end,
+        }
+    end
+
+    function aba:Slider(nome, minimo, maximo, incremento, inicial, sufixo, cb)
+        local f = caixa(54)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 4),
+            Size = UDim2.new(1, -110, 0, 24),
+            Text = nome,
+        })
+        local valorLabel = texto(f, {
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -12, 0, 4),
+            Size = UDim2.fromOffset(100, 24),
+            TextXAlignment = Enum.TextXAlignment.Right,
+            Font = Enum.Font.Code,
+            TextSize = 12,
+            TextColor3 = T.Ciano,
+            Text = "",
+        })
+
+        local trilho = criar("Frame", {
+            Position = UDim2.new(0, 12, 0, 36),
+            Size = UDim2.new(1, -24, 0, 4),
+            BackgroundColor3 = T.Off,
+            BorderSizePixel = 0,
+        }, f)
+        cantos(trilho, 3)
+        local preenche = criar("Frame", {
+            Size = UDim2.fromScale(0, 1),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, trilho)
+        cantos(preenche, 3)
+        neon(preenche, 0)
+        local bola = criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0, 0.5),
+            Size = UDim2.fromOffset(12, 12),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, trilho)
+        cantos(bola, 6)
+        borda(bola, T.Ciano, 0.2, 2)
+
+        local valor = inicial
+        local function mostrar()
+            local frac = (valor - minimo) / (maximo - minimo)
+            preenche.Size = UDim2.fromScale(frac, 1)
+            bola.Position = UDim2.fromScale(frac, 0.5)
+            valorLabel.Text = tostring(math.floor(valor * 100 + 0.5) / 100) .. (sufixo or "")
+        end
+        mostrar()
+
+        local zona = criar("TextButton", {
+            Position = UDim2.fromOffset(0, 26),
+            Size = UDim2.new(1, 0, 0, 26),
+            BackgroundTransparency = 1,
+            Text = "",
+        }, f)
+        arrastavel(zona, function(x)
+            local frac = math.clamp((x - trilho.AbsolutePosition.X) / math.max(trilho.AbsoluteSize.X, 1), 0, 1)
+            local v = minimo + frac * (maximo - minimo)
+            v = math.floor(v / incremento + 0.5) * incremento
+            v = math.clamp(v, minimo, maximo)
+            if v ~= valor then
+                valor = v
+                mostrar()
+                cb(valor)
+            end
+        end)
+    end
+
+    -- caixa de texto (ex.: colar um ID)
+    function aba:Entrada(nome, placeholder, cb)
+        local f = caixa(46)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 0),
+            Size = UDim2.new(0.5, -12, 1, 0),
+            Text = nome,
+        })
+        local campo = criar("TextBox", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -10, 0.5, 0),
+            Size = UDim2.new(0.5, -16, 0, 28),
+            BackgroundColor3 = T.Fundo,
+            Text = "",
+            PlaceholderText = placeholder or "",
+            PlaceholderColor3 = T.Dim,
+            TextColor3 = T.Texto,
+            Font = T.Fonte,
+            TextSize = 12,
+            ClearTextOnFocus = false,
+        }, f)
+        cantos(campo, 6)
+        borda(campo, T.Ciano, 0.5)
+        campo.FocusLost:Connect(function() cb(campo.Text) end)
+    end
+
+    -- grade de opções com pré-visualização e rótulo (ex.: "ID 3")
+    function aba:Botao(nome, cb)
+        local f = caixa(40)
+        local b = criar("TextButton", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.new(1, -20, 0, 30),
+            BackgroundColor3 = T.Fundo,
+            Text = nome,
+            TextColor3 = T.Texto,
+            Font = T.Fonte,
+            TextSize = 12,
+            AutoButtonColor = true,
+        }, f)
+        cantos(b, 6)
+        borda(b, T.Ciano, 0.2)
+        b.MouseButton1Click:Connect(function() pcall(cb) end)
+    end
+
+    function aba:Grade(itens, aoEscolher, colunas)
+        colunas = colunas or 4
+        local linhas = math.ceil(#itens / colunas)
+        local f = caixa(linhas * 78 + (linhas - 1) * 6 + 16)
+
+        local area = criar("Frame", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+        }, f)
+        criar("UIPadding", {
+            PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8),
+            PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+        }, area)
+        criar("UIGridLayout", {
+            CellSize = UDim2.new(1 / colunas, -6, 0, 78),
+            CellPadding = UDim2.fromOffset(6, 6),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, area)
+
+        local celulas = {}
+        local function selecionar(n)
+            for k, c in ipairs(celulas) do
+                c.contorno.Transparency = (k == n) and 0 or 0.7
+                c.contorno.Thickness = (k == n) and 2 or 1
+            end
+            aoEscolher(n)
+        end
+
+        for n, item in ipairs(itens) do
+            local celula = criar("TextButton", {
+                BackgroundColor3 = T.Painel,
+                Text = "",
+                AutoButtonColor = false,
+                LayoutOrder = n,
+            }, area)
+            cantos(celula, 8)
+            local contorno = borda(celula, T.Ciano, 0.7)
+
+            local previa = criar("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0),
+                Position = UDim2.new(0.5, 0, 0, 8),
+                Size = UDim2.fromOffset(40, 40),
+                BackgroundTransparency = 1,
+            }, celula)
+            item.desenhar(previa)
+
+            texto(celula, {
+                Position = UDim2.new(0, 0, 1, -24),
+                Size = UDim2.new(1, 0, 0, 20),
+                Text = item.rotulo,
+                TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Center,
+            })
+
+            celulas[n] = { contorno = contorno }
+            celula.MouseButton1Click:Connect(function() selecionar(n) end)
+        end
+
+        return { Selecionar = selecionar }
+    end
+
+    function aba:Cor(nome, inicial, lista, cb)
+        local f = caixa(86)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 4),
+            Size = UDim2.new(1, -60, 0, 24),
+            Text = nome,
+        })
+        local previa = criar("Frame", {
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -12, 0, 9),
+            Size = UDim2.fromOffset(34, 14),
+            BackgroundColor3 = inicial,
+            BorderSizePixel = 0,
+        }, f)
+        cantos(previa, 4)
+        borda(previa, Color3.new(1, 1, 1), 0.6)
+
+        local function aplicar(cor)
+            previa.BackgroundColor3 = cor
+            cb(cor)
+        end
+
+        local fila = criar("Frame", {
+            Position = UDim2.fromOffset(12, 32),
+            Size = UDim2.new(1, -24, 0, 20),
+            BackgroundTransparency = 1,
+        }, f)
+        criar("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            Padding = UDim.new(0, 5),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, fila)
+        for i, cor in ipairs(lista) do
+            local b = criar("TextButton", {
+                Size = UDim2.fromOffset(30, 20),
+                BackgroundColor3 = cor,
+                Text = "",
+                AutoButtonColor = false,
+                LayoutOrder = i,
+            }, fila)
+            cantos(b, 5)
+            borda(b, Color3.new(1, 1, 1), 0.75)
+            b.MouseButton1Click:Connect(function() aplicar(cor) end)
+        end
+
+        local hue = criar("Frame", {
+            Position = UDim2.new(0, 12, 0, 62),
+            Size = UDim2.new(1, -24, 0, 10),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, f)
+        cantos(hue, 5)
+        criar("UIGradient", {
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromHSV(0, 1, 1)),
+                ColorSequenceKeypoint.new(1 / 6, Color3.fromHSV(1 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(2 / 6, Color3.fromHSV(2 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(3 / 6, Color3.fromHSV(3 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(4 / 6, Color3.fromHSV(4 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(5 / 6, Color3.fromHSV(5 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(1, Color3.fromHSV(1, 1, 1)),
+            }),
+        }, hue)
+        local bolaHue = criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0, 0.5),
+            Size = UDim2.fromOffset(6, 16),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+            Visible = false,
+        }, hue)
+        cantos(bolaHue, 3)
+
+        local zona = criar("TextButton", {
+            Position = UDim2.fromOffset(0, 56),
+            Size = UDim2.new(1, 0, 0, 24),
+            BackgroundTransparency = 1,
+            Text = "",
+        }, f)
+        arrastavel(zona, function(x)
+            local frac = math.clamp((x - hue.AbsolutePosition.X) / math.max(hue.AbsoluteSize.X, 1), 0, 1)
+            bolaHue.Visible = true
+            bolaHue.Position = UDim2.fromScale(frac, 0.5)
+            aplicar(Color3.fromHSV(frac, 1, 1))
+        end)
+    end
+
+    if not abaAtiva then selecionar() end
+    return aba
+end
+
+-- ---------- MIRA NA TELA (crosshair) ----------
+-- Desenha o crosshair com formas (sem precisar de imagem) e mostra o "ID" de cada modelo.
+local function formaMira(pai, id, cor)
+    local function barra(x, y, w, h, rot)
+        return criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.new(0.5, x, 0.5, y),
+            Size = UDim2.fromOffset(w, h),
+            BackgroundColor3 = cor,
+            BorderSizePixel = 0,
+            Rotation = rot or 0,
+        }, pai)
+    end
+    local function ponto(tam)
+        local f = barra(0, 0, tam, tam)
+        cantos(f, 100)
+        return f
+    end
+    local function anel(tam, grosso, quadrado)
+        local f = criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(tam, tam),
+            BackgroundTransparency = 1,
+        }, pai)
+        criar("UIStroke", { Color = cor, Thickness = grosso }, f)
+        if not quadrado then
+            criar("UICorner", { CornerRadius = UDim.new(1, 0) }, f)
+        end
+        return f
+    end
+
+    if id == 1 then
+        ponto(5)
+    elseif id == 2 then
+        barra(0, -9, 2, 8) barra(0, 9, 2, 8) barra(-9, 0, 8, 2) barra(9, 0, 8, 2)
+    elseif id == 3 then
+        barra(0, -13, 1, 12) barra(0, 13, 1, 12) barra(-13, 0, 12, 1) barra(13, 0, 12, 1)
+    elseif id == 4 then
+        anel(22, 2)
+    elseif id == 5 then
+        anel(22, 1.5) ponto(3)
+    elseif id == 6 then
+        barra(0, 0, 2, 26, 45) barra(0, 0, 2, 26, -45)
+    elseif id == 7 then
+        barra(-9, 0, 8, 2) barra(9, 0, 8, 2) barra(0, 9, 2, 8)
+    elseif id == 8 then
+        barra(-5, 2, 14, 2, -35) barra(5, 2, 14, 2, 35)
+    elseif id == 9 then
+        anel(20, 1.5, true)
+    elseif id == 10 then
+        barra(0, -9, 2, 8) barra(0, 9, 2, 8) barra(-9, 0, 8, 2) barra(9, 0, 8, 2) ponto(3)
+    elseif id == 11 then
+        anel(16, 1.5, true).Rotation = 45
+    else
+        anel(28, 1) barra(0, -7, 2, 6) barra(0, 7, 2, 6) barra(-7, 0, 6, 2) barra(7, 0, 6, 2)
+    end
+end
+local TOTAL_MIRAS = 12
+
+local miraGui = Instance.new("ScreenGui")
+miraGui.Name = "TomajackMira"
+miraGui.ResetOnSpawn = false
+miraGui.DisplayOrder = 500
+miraGui.IgnoreGuiInset = true
+do
+    local ok = pcall(function()
+        miraGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok or not miraGui.Parent then
+        miraGui.Parent = player:WaitForChild("PlayerGui")
+    end
+end
+
+local miraBox = criar("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(40, 40),
+    BackgroundTransparency = 1,
+}, miraGui)
+local miraEscala = criar("UIScale", { Scale = 1 }, miraBox)
+
+local function atualizarMira()
+    for _, c in ipairs(miraBox:GetChildren()) do
+        if not c:IsA("UIScale") then c:Destroy() end
+    end
+    miraBox.Visible = Config.Mira
+    miraEscala.Scale = Config.MiraTam
+    if not Config.Mira then return end
+
+    local idImg = tostring(Config.MiraImagem or ""):match("%d+")
+    if idImg then
+        criar("ImageLabel", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(40, 40),
+            BackgroundTransparency = 1,
+            Image = "rbxassetid://" .. idImg,
+        }, miraBox)
+    else
+        formaMira(miraBox, Config.MiraId, Config.MiraCor)
+    end
+end
+atualizarMira()
+
+-- ---------- CÉUS ----------
+-- Troca o clima do jogo: horário, estrelas, cores e névoa. Tudo volta ao normal em "Original".
+local CEUS = {
+    { nome = "Galáxia", hora = 0, estrelas = 5000, topo = Color3.fromRGB(140, 60, 255), base = Color3.fromRGB(30, 10, 90),
+      amb = Color3.fromRGB(60, 40, 110), atm = { Color3.fromRGB(120, 80, 200), Color3.fromRGB(70, 20, 140), 0.35, 0.6 } },
+    { nome = "Nebulosa rosa", hora = 0, estrelas = 4000, topo = Color3.fromRGB(255, 70, 170), base = Color3.fromRGB(60, 10, 80),
+      amb = Color3.fromRGB(90, 40, 100), atm = { Color3.fromRGB(230, 110, 190), Color3.fromRGB(120, 30, 110), 0.35, 0.55 } },
+    { nome = "Espaço", hora = 0, estrelas = 5000, topo = Color3.fromRGB(10, 10, 40), base = Color3.fromRGB(0, 0, 0),
+      amb = Color3.fromRGB(30, 30, 55), atm = false },
+    { nome = "Aurora", hora = 0, estrelas = 3500, topo = Color3.fromRGB(0, 255, 170), base = Color3.fromRGB(10, 40, 60),
+      amb = Color3.fromRGB(30, 80, 90), atm = { Color3.fromRGB(90, 230, 200), Color3.fromRGB(20, 90, 90), 0.3, 0.5 } },
+    { nome = "Noite azul", hora = 23.5, estrelas = 3000, topo = Color3.fromRGB(40, 90, 200), base = Color3.fromRGB(5, 15, 45),
+      amb = Color3.fromRGB(50, 70, 120), atm = { Color3.fromRGB(80, 110, 190), Color3.fromRGB(30, 45, 100), 0.25, 0.3 } },
+    { nome = "Pôr do sol", hora = 17.8, estrelas = 0, topo = Color3.fromRGB(255, 120, 40), base = Color3.fromRGB(120, 30, 60),
+      amb = Color3.fromRGB(150, 100, 90), atm = { Color3.fromRGB(255, 170, 110), Color3.fromRGB(200, 90, 60), 0.3, 0.4 } },
+    { nome = "Amanhecer", hora = 5.9, estrelas = 300, topo = Color3.fromRGB(255, 170, 120), base = Color3.fromRGB(90, 110, 180),
+      amb = Color3.fromRGB(130, 120, 130), atm = { Color3.fromRGB(240, 180, 150), Color3.fromRGB(150, 110, 130), 0.3, 0.35 } },
+    { nome = "Dia claro", hora = 14, estrelas = 0, topo = Color3.fromRGB(120, 180, 255), base = Color3.fromRGB(255, 255, 255),
+      amb = Color3.fromRGB(120, 130, 145), atm = { Color3.fromRGB(190, 215, 255), Color3.fromRGB(120, 140, 170), 0.2, 0.15 } },
+    { nome = "Sangue", hora = 0.5, estrelas = 1500, topo = Color3.fromRGB(255, 20, 20), base = Color3.fromRGB(40, 0, 0),
+      amb = Color3.fromRGB(90, 30, 30), atm = { Color3.fromRGB(200, 40, 40), Color3.fromRGB(90, 10, 10), 0.35, 0.5 } },
+    { nome = "Neon", hora = 0, estrelas = 800, topo = Color3.fromRGB(0, 230, 255), base = Color3.fromRGB(255, 0, 170),
+      amb = Color3.fromRGB(80, 60, 120), atm = { Color3.fromRGB(150, 80, 220), Color3.fromRGB(100, 30, 150), 0.3, 0.45 } },
+}
+
+local ceu = { ativo = false, hora = 0, original = nil, skies = {}, sky = nil, atm = nil, atmCriada = false, atmOrig = nil }
+
+local function restaurarCeu()
+    ceu.ativo = false
+    if ceu.sky then pcall(function() ceu.sky:Destroy() end) ceu.sky = nil end
+    for _, sk in ipairs(ceu.skies) do
+        pcall(function() sk.Parent = Lighting end)
+    end
+    ceu.skies = {}
+    if ceu.atm then
+        if ceu.atmCriada then
+            pcall(function() ceu.atm:Destroy() end)
+        elseif ceu.atmOrig then
+            for k, v in pairs(ceu.atmOrig) do
+                pcall(function() ceu.atm[k] = v end)
+            end
+        end
+    end
+    ceu.atm, ceu.atmCriada, ceu.atmOrig = nil, false, nil
+    if ceu.original then
+        for k, v in pairs(ceu.original) do
+            pcall(function() Lighting[k] = v end)
+        end
+        ceu.original = nil
+    end
+end
+
+local function aplicarCeu(indice)
+    local c = CEUS[indice]
+    if not c then
+        restaurarCeu()
+        return
+    end
+
+    if not ceu.original then
+        ceu.original = {}
+        for _, k in ipairs({ "ClockTime", "Ambient", "OutdoorAmbient", "ColorShift_Top", "ColorShift_Bottom" }) do
+            pcall(function() ceu.original[k] = Lighting[k] end)
+        end
+    end
+
+    -- esconde o céu do jogo (e põe de volta ao restaurar)
+    if not ceu.sky then
+        for _, o in ipairs(Lighting:GetChildren()) do
+            if o:IsA("Sky") then
+                ceu.skies[#ceu.skies + 1] = o
+            end
+        end
+        for _, o in ipairs(ceu.skies) do
+            o.Parent = nil
+        end
+        ceu.sky = Instance.new("Sky")
+        ceu.sky.Name = "TomajackCeu"
+        ceu.sky.Parent = Lighting
+    end
+    ceu.sky.StarCount = c.estrelas
+    ceu.sky.CelestialBodiesShown = true
+    ceu.sky.MoonAngularSize = 14
+    ceu.sky.SunAngularSize = 22
+
+    -- iluminação e horário
+    ceu.hora = c.hora
+    pcall(function()
+        Lighting.ClockTime = c.hora
+        Lighting.ColorShift_Top = c.topo
+        Lighting.ColorShift_Bottom = c.base
+        Lighting.Ambient = c.amb
+        Lighting.OutdoorAmbient = c.amb
+    end)
+
+    -- névoa atmosférica colorida
+    if not ceu.atm then
+        local existente = Lighting:FindFirstChildOfClass("Atmosphere")
+        if existente then
+            ceu.atm = existente
+            ceu.atmOrig = {
+                Density = existente.Density, Offset = existente.Offset, Color = existente.Color,
+                Decay = existente.Decay, Glare = existente.Glare, Haze = existente.Haze,
+            }
+        elseif c.atm then
+            ceu.atm = Instance.new("Atmosphere")
+            ceu.atm.Name = "TomajackCeuNevoa"
+            ceu.atm.Parent = Lighting
+            ceu.atmCriada = true
+        end
+    end
+    if ceu.atm then
+        if c.atm then
+            ceu.atm.Color = c.atm[1]
+            ceu.atm.Decay = c.atm[2]
+            ceu.atm.Density = c.atm[3]
+            ceu.atm.Haze = c.atm[4]
+            ceu.atm.Offset = 0.25
+            ceu.atm.Glare = 0
+        else
+            ceu.atm.Density = 0
+        end
+    end
+    ceu.ativo = true
+end
+
+-- mantém o horário escolhido (alguns jogos ficam mudando a hora)
+task.spawn(function()
+    while not hubFechado do
+        if ceu.ativo then
+            pcall(function() Lighting.ClockTime = ceu.hora end)
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ---------- conteúdo das abas ----------
+local CORES = {
+    Color3.fromRGB(0, 229, 255),   -- ciano
+    Color3.fromRGB(255, 0, 200),   -- magenta
+    Color3.fromRGB(255, 255, 0),   -- amarelo
+    Color3.fromRGB(0, 120, 255),   -- azul
+    Color3.fromRGB(255, 0, 0),     -- vermelho
+    Color3.fromRGB(0, 255, 60),    -- verde
+    Color3.fromRGB(160, 40, 255),  -- roxo
+    Color3.fromRGB(255, 140, 0),   -- laranja
+    Color3.fromRGB(255, 255, 255), -- branco
+}
+
+local abaMira = novaAba("MIRA", "◎")
+local abaVisual = novaAba("VISUAL", "◈")
+local abaEsp = novaAba("ESP", "▣")
+local abaExtra = novaAba("EXTRA", "✦")
+local abaCeu = novaAba("CÉU", "☾")
+local abaMira2 = novaAba("CROSSHAIR", "✛")
+
+-- MIRA
+abaMira:Secao("aim lock")
+local toggleTronco, toggleCabeca
+
+-- liga/desliga o aim lock e mantém só uma das duas opções ligada
+local function aplicarAim(ligado, parte)
+    Config.Ligado = ligado
+    if parte then Config.AlvoParte = parte end
+    toggleTronco.Set(ligado and Config.AlvoParte == "Tronco")
+    toggleCabeca.Set(ligado and Config.AlvoParte == "Cabeça")
+end
+
+toggleTronco = abaMira:Toggle("Aimlock tronco", false, function(v) aplicarAim(v, "Tronco") end)
+toggleCabeca = abaMira:Toggle("Aimlock cabeça", false, function(v) aplicarAim(v, "Cabeça") end)
+abaMira:Toggle("Só travar segurando botão direito", true, function(v) Config.SoSegurando = v end)
+abaMira:Slider("FOV do aimlock (raio)", 30, 1500, 5, Config.FOV, " px", function(v) Config.FOV = v end)
+abaMira:Slider("Alcance máximo", 100, 10000, 100, Config.AlcanceMax, " studs", function(v) Config.AlcanceMax = v end)
+abaMira:Toggle("FOV maior para alvos distantes", true, function(v) Config.FOVDinamico = v end)
+abaMira:Slider("Suavidade (1 = grudado)", 0.05, 1, 0.05, Config.Suavidade, "", function(v) Config.Suavidade = v end)
+abaMira:Secao("filtros")
+abaMira:Toggle("Ignorar meu time", false, function(v) Config.TeamCheck = v end)
+abaMira:Toggle("Ignorar amigos do Roblox", true, function(v) Config.IgnorarAmigos = v end)
+abaMira:Entrada("Nicks para ignorar", "nick1, nick2", function(t)
+    table.clear(listaIgnorar)
+    for nome in string.gmatch(t or "", "[^,%s]+") do
+        listaIgnorar[string.lower(nome)] = true
+    end
+end)
+abaMira:Slider("Ignorar parede acima de", 50, 3000, 50, Config.WallCheckMax, " studs", function(v) Config.WallCheckMax = v end)
+abaMira:Toggle("Não travar através de parede", true, function(v) Config.WallCheck = v end)
+abaMira:Toggle("Mostrar círculo do FOV", true, function(v) Config.MostrarFOV = v end)
+
+-- VISUAL
+abaVisual:Secao("chams")
+abaVisual:Toggle("Chams (pintar jogadores)", false, function(v) Config.Chams = v end)
+abaVisual:Cor("Cor dos chams", Config.ChamsCor, CORES, function(c) Config.ChamsCor = c end)
+abaVisual:Slider("Transparência do preenchimento", 0, 1, 0.05, Config.ChamsPreenchimento, "", function(v) Config.ChamsPreenchimento = v end)
+abaVisual:Toggle("Contorno", true, function(v) Config.ChamsContorno = v end)
+abaVisual:Toggle("Ver através da parede", true, function(v) Config.ChamsAtravesParede = v end)
+abaVisual:Toggle("Ignorar meu time", true, function(v) Config.ChamsIgnorarTime = v end)
+abaVisual:Secao("barra de vida")
+abaVisual:Toggle("Barra de vida em cima do nome", false, function(v)
+    Config.BarraVida = v
+    if v and not temDrawing then
+        notificar("Barra de vida", "Seu executor não tem Drawing.", 4)
+    end
+end)
+abaVisual:Slider("Altura da barra", 0, 4, 0.1, Config.AlturaBarra, "", function(v) Config.AlturaBarra = v end)
+abaVisual:Slider("Distância máxima", 100, 3000, 50, Config.EspDistancia, " studs", function(v) Config.EspDistancia = v end)
+
+-- ESP
+abaEsp:Secao("esp")
+abaEsp:Toggle("ESP", false, function(v)
+    Config.Esp = v
+    if v and not temDrawing then
+        notificar("ESP", "Seu executor não tem Drawing.", 4)
+    end
+end)
+abaEsp:Toggle("Caixa", true, function(v) Config.EspCaixa = v end)
+abaEsp:Toggle("Nome", true, function(v) Config.EspNome = v end)
+abaEsp:Toggle("Vida (barra e número)", true, function(v) Config.EspVidaLado = v end)
+abaEsp:Toggle("Distância", true, function(v) Config.EspDistTexto = v end)
+abaEsp:Toggle("Só inimigos (não mostra meu time)", true, function(v) Config.EspSoInimigos = v end)
+abaEsp:Secao("cores")
+abaEsp:Cor("Cor da caixa", Config.EspCor, CORES, function(c) Config.EspCor = c end)
+abaEsp:Cor("Cor do nome", Config.EspNomeCor, CORES, function(c) Config.EspNomeCor = c end)
+
+-- CÉU
+abaCeu:Secao("escolha o céu")
+do
+    local itens = {
+        {
+            rotulo = "Original",
+            desenhar = function(box)
+                local f = criar("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = T.Off, BorderSizePixel = 0 }, box)
+                cantos(f, 10)
+                texto(f, {
+                    Size = UDim2.fromScale(1, 1), Text = "✕", TextSize = 18,
+                    TextXAlignment = Enum.TextXAlignment.Center, TextColor3 = T.Dim,
+                })
+            end,
+        },
+    }
+    for _, c in ipairs(CEUS) do
+        itens[#itens + 1] = {
+            rotulo = c.nome,
+            desenhar = function(box)
+                local f = criar("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, box)
+                cantos(f, 10)
+                criar("UIGradient", { Color = ColorSequence.new(c.topo, c.base), Rotation = 90 }, f)
+            end,
+        }
+    end
+    abaCeu:Grade(itens, function(n)
+        aplicarCeu(n - 1) -- 1 = Original (restaura)
+    end, 3)
+end
+
+-- CROSSHAIR
+abaMira2:Secao("mira na tela")
+abaMira2:Toggle("Mira customizada", false, function(v)
+    Config.Mira = v
+    atualizarMira()
+end)
+do
+    local itens = {}
+    for n = 1, TOTAL_MIRAS do
+        itens[n] = {
+            rotulo = "ID " .. n,
+            desenhar = function(box) formaMira(box, n, T.Texto) end,
+        }
+    end
+    local grade = abaMira2:Grade(itens, function(n)
+        Config.MiraId = n
+        Config.MiraImagem = ""
+        atualizarMira()
+    end, 4)
+    grade.Selecionar(1)
+end
+abaMira2:Cor("Cor da mira", Config.MiraCor, CORES, function(c)
+    Config.MiraCor = c
+    atualizarMira()
+end)
+abaMira2:Slider("Tamanho da mira", 0.5, 3, 0.1, Config.MiraTam, "x", function(v)
+    Config.MiraTam = v
+    atualizarMira()
+end)
+abaMira2:Secao("imagem própria")
+abaMira2:Entrada("ID de imagem", "ex: 1234567890", function(t)
+    Config.MiraImagem = t
+    atualizarMira()
+end)
+
+-- EXTRA
+abaExtra:Secao("shader")
+abaExtra:Toggle("Shader realista", false, function(v)
+    Config.Shader = v
+    if v then aplicarShader() else removerShader() end
+end)
+abaExtra:Slider("Nível (1 leve / 2 realista / 3 ultra)", 1, 3, 1, Config.ShaderNivel, "", function(v)
+    Config.ShaderNivel = v
+    if Config.Shader then aplicarShader() end
+end)
+abaExtra:Slider("Intensidade do shader", 0.2, 1.5, 0.1, Config.ShaderIntensidade, "", function(v)
+    Config.ShaderIntensidade = v
+    if Config.Shader then aplicarShader() end
+end)
+abaExtra:Secao("campo de visão (fov da câmera)")
+abaExtra:Toggle("FOV da câmera", false, function(v) Config.CamFOVAtivo = v end)
+abaExtra:Slider("Campo de visão", 40, 120, 1, Config.CamFOV, "°", function(v) Config.CamFOV = v end)
+abaExtra:Secao("esticar tela")
+abaExtra:Toggle("Esticar tela", false, function(v) Config.Esticar = v end)
+abaExtra:Slider("Intensidade (menor = mais esticado)", 0.3, 1, 0.05, Config.EsticarValor, "", function(v)
+    Config.EsticarValor = v
+end)
+abaExtra:Secao("anti lag")
+abaExtra:Toggle("Desligar efeitos (blur, bloom, raios)", false, antiLagEfeitos)
+abaExtra:Toggle("Desligar sombras", false, antiLagSombras)
+abaExtra:Toggle("Texturas simples (material liso)", false, antiLagTexturas)
+abaExtra:Toggle("Desligar partículas, fogo e rastros", false, antiLagParticulas)
+abaExtra:Toggle("Qualidade gráfica mínima", false, antiLagQualidade)
+
+-- ---------- janela: arrastar, esconder, animação ----------
+do
+    local arrastando, inicioDrag, posInicial = false, nil, nil
+    topo.InputBegan:Connect(function(i)
+        if ehClique(i) then
+            arrastando = true
+            inicioDrag = i.Position
+            posInicial = main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if arrastando and ehMovimento(i) then
+            local d = i.Position - inicioDrag
+            main.Position = UDim2.new(
+                posInicial.X.Scale, posInicial.X.Offset + d.X,
+                posInicial.Y.Scale, posInicial.Y.Offset + d.Y
+            )
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if ehClique(i) then arrastando = false end
+    end)
+end
+
+local menuAberto = true
+local function alternarMenu()
+    menuAberto = not menuAberto
+    if menuAberto then
+        main.Visible = true
+        tw(escala, 0.2, { Scale = 1 })
+    else
+        tw(escala, 0.15, { Scale = 0.92 })
+        task.delay(0.15, function()
+            if not menuAberto then main.Visible = false end
+        end)
+    end
+end
+
+botaoMin.MouseButton1Click:Connect(function()
+    alternarMenu()
+    notificar("Menu escondido", "Aperte RightShift para abrir.", 3)
+end)
+
+Conex[#Conex + 1] = UserInputService.InputBegan:Connect(function(i, processado)
+    if processado then return end
+    if i.KeyCode == Enum.KeyCode.RightShift then
+        alternarMenu()
+    elseif i.KeyCode == Enum.KeyCode.H then
+        aplicarAim(not Config.Ligado)
+        notificar("Aim Lock", Config.Ligado and ("LIGADO (" .. Config.AlvoParte .. ")") or "DESLIGADO", 1.5)
+    end
+end)
+
+
+-- ---------- fechar o hub por completo ----------
+-- Desliga tudo, devolve o que foi alterado (anti lag, esticar tela), apaga os
+-- desenhos e a janela. Depois disso o hub some até você executar o script de novo.
+local function fecharHub()
+    if hubFechado then return end
+    hubFechado = true
+
+    Config.Ligado = false
+    Config.Chams = false
+    Config.BarraVida = false
+    Config.Esp = false
+    Config.Esticar = false
+    Config.CamFOVAtivo = false
+    Config.Shader = false
+    removerShader()
+    restaurarCeu()
+    pcall(function() miraGui:Destroy() end)
+    if camFovOriginal then
+        pcall(function() Workspace.CurrentCamera.FieldOfView = camFovOriginal end)
+        camFovOriginal = nil
+    end
+
+    for _, nome in ipairs({ "AimLockTronco", "VidaTomajack", "EspTomajack", "EsticarTomajack", "CamFovTomajack" }) do
+        pcall(function() RunService:UnbindFromRenderStep(nome) end)
+    end
+
+    for _, c in ipairs(Conex) do
+        pcall(function() c:Disconnect() end)
+    end
+
+    -- devolve o que o anti lag mudou
+    pcall(antiLagEfeitos, false)
+    pcall(antiLagTexturas, false)
+    pcall(antiLagParticulas, false)
+    pcall(antiLagSombras, false)
+    pcall(antiLagQualidade, false)
+
+    -- apaga desenhos
+    if circulo then pcall(function() circulo:Remove() end) end
+    for _, info in pairs(infos) do
+        for _, k in ipairs({ "barraBorda", "barraVida" }) do
+            if info[k] then pcall(function() info[k]:Remove() end) end
+        end
+        if info.esp then
+            for _, d in pairs(info.esp) do
+                pcall(function() d:Remove() end)
+            end
+        end
+    end
+
+    for p in pairs(chams) do
+        removerChams(p)
+    end
+    pcall(function() chamsPasta:Destroy() end)
+    pcall(function() gui:Destroy() end)
+
+    if env.TomajackFechar == fecharHub then
+        env.TomajackFechar = nil
+    end
+end
+
+env.TomajackFechar = fecharHub
+botaoFechar.MouseButton1Click:Connect(fecharHub)
+
+tw(escala, 0.3, { Scale = 1 })
+notificar("Hive Services", "Carregado. RightShift esconde o menu.", 4)
